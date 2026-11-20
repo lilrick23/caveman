@@ -13,8 +13,12 @@ stores. Do not put API keys in either configuration file.
 Global feature configuration lives at:
 
 ```text
-~/.caveman-cloud/config.json
+~/.caveman/cloud.json
 ```
+
+`CAVEMAN_HOME` moves it with the rest of `~/.caveman`. Older CLIs kept it in
+`~/.caveman-cloud/config.json`; the first read copies that file over and leaves
+the original in place for any older CLI still on `PATH`.
 
 A project can add a restricted overlay at:
 
@@ -158,6 +162,14 @@ compat:
     base_url: https://api.z.ai/api/anthropic
     wire_dialect: anthropic
 ```
+
+A provider entry takes `base_url`, `billing_tier` and `region` only. It has no
+`forward_headers`: a provider route forwards the headers its wire protocol
+declares and nothing else, so the key is refused at startup rather than
+ignored. An upstream that authenticates with an extra header — a gateway in
+front of the provider, for instance — is configured as a compat mount instead
+(`compat.<name>`, below, with `wire_dialect: anthropic` when it answers the
+Anthropic Messages protocol).
 
 `wire_dialect` declares the wire grammar the mount's upstream actually speaks.
 Empty (the default) keeps the shared OpenAI shape everywhere. Set `anthropic`

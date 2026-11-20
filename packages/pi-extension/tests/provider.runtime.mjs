@@ -249,6 +249,20 @@ test("unlisted providers stay direct with an actionable mount notice", async () 
   assert.match(h.notices.at(-1), /no compat mount named "unlisted-relay".*add compat\.unlisted-relay\.base_url/);
 });
 
+// #1324: that remedy has to work for Pi's own DeepSeek provider, whose base is
+// https://api.deepseek.com with no /v1. A mount on the same base routes it, and
+// closing the gate gives the model its own endpoint back.
+test("a compat mount routes a provider whose OpenAI base has no /v1", async () => {
+  const deepseek = { provider: "deepseek", id: "deepseek-flash", api: "openai-completions", baseUrl: "https://api.deepseek.com" };
+  const h = harness([deepseek]);
+  await h.router.openGate(GATEWAY, h.ctx, { deepseek: "https://api.deepseek.com" }, NATIVE);
+  assert.equal(h.router.routing(), true, h.notices.join("\n"));
+  assert.equal(h.ctx.model.baseUrl, `${GATEWAY}/w/pi/compat/deepseek`);
+  assert.deepEqual(h.notices, []);
+  assert.equal(await h.router.closeGate(h.ctx), true);
+  assert.deepEqual(h.ctx.model, deepseek);
+});
+
 test("a provider whose baseUrl is a sentinel is not offered a compat mount", async () => {
   const bridge = { provider: "claude-bridge", id: "m", api: "anthropic-messages", baseUrl: "claude-bridge" };
   const h = harness([bridge]);
@@ -544,4 +558,49 @@ test("real Pi preserves custom models, auth, and stream handlers through route a
   assert.deepEqual(registry.find("relay", "custom-model"), original);
   assert.equal(registry.getRegisteredProviderConfig("relay"), registration);
   assert.equal((await registry.getApiKeyAndHeaders(original)).apiKey, "fake-local-test-key");
+});
+
+// #1449: router/auto is a pi VIRTUAL model (api "pi-virtual", empty baseUrl).
+// Pi resolves it to a physical model before any transport, so it never sends an
+// HTTP request: there is no upstream to mount and no compat.<name>.base_url that
+// could make it routable. Warning once per such model per session told the user
+// to fix something that cannot be fixed, and claimed "no compression" for a
+// request that never leaves the process.
+test("a pi-virtual model is passed through without a warning", async () => {
+  const virtual = { provider: "router", id: "auto", api: "pi-virtual", baseUrl: "" };
+  const h = harness([virtual]);
+  await h.router.openGate(GATEWAY, h.ctx, COMPAT, NATIVE);
+  assert.equal(h.router.routing(), false);
+  assert.deepEqual(h.ctx.model, virtual);
+  assert.deepEqual(h.notices, []);
+});
+
+// "router" is also a legitimately mountable compat name, so the guard has to key
+// on the virtual API and not on the provider name: a provider called router with
+// a real HTTP baseUrl must keep routing exactly as it does today.
+test("a provider named router with a real endpoint still routes", async () => {
+  const mounted = { provider: "router", id: "m", api: "openai-completions", baseUrl: "http://127.0.0.1:4000/v1" };
+  const h = harness([mounted]);
+  await h.router.openGate(GATEWAY, h.ctx, { router: "http://127.0.0.1:4000" }, NATIVE);
+  assert.equal(h.router.routing(), true, h.notices.join("\n"));
+  assert.equal(h.ctx.model.baseUrl, `${GATEWAY}/w/pi/compat/router/v1`);
+  assert.deepEqual(h.notices, []);
+  assert.equal(await h.router.closeGate(h.ctx), true);
+  assert.deepEqual(h.ctx.model, mounted);
+});
+
+// A pi-virtual model selected while a route is live must restore the real
+// endpoint, not merely stay quiet: silence plus a stale routed baseUrl would
+// leave the previous model's route on an object the host still dispatches on.
+test("selecting a pi-virtual model restores the previous route", async () => {
+  const h = harness([
+    { provider: "relay", id: "default", api: "openai-completions", baseUrl: "http://127.0.0.1:4000/v1" },
+    { provider: "router", id: "auto", api: "pi-virtual", baseUrl: "" },
+  ]);
+  await h.router.openGate(GATEWAY, h.ctx, COMPAT, NATIVE);
+  assert.equal(h.router.routing(), true, h.notices.join("\n"));
+  await h.select("auto");
+  assert.equal(h.router.routing(), false);
+  assert.equal(h.ctx.model.baseUrl, "");
+  assert.deepEqual(h.notices, []);
 });

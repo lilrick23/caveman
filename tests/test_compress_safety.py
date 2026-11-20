@@ -73,6 +73,68 @@ class CompressSafetyTests(unittest.TestCase):
         path.write_text(text, encoding="utf-8", newline="")
         return path
 
+    def test_same_filename_in_two_projects_each_keep_their_own_original(self):
+        """#1351: both projects' .claude/CLAUDE.md mapped to one backup slot, so the
+        second run aborted on the first project's backup — and the abort told the
+        user to delete it, destroying the other project's only uncompressed copy."""
+        body = "# Notes\n\n" + "Some long natural language prose to compress here. " * 10 + "\n"
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as data_home, \
+             mock.patch.dict(os.environ, {"XDG_DATA_HOME": data_home, "LOCALAPPDATA": data_home}):
+            paths = []
+            for project in ("home", "repo"):
+                claude_dir = Path(tmp) / project / ".claude"
+                claude_dir.mkdir(parents=True)
+                path = claude_dir / "CLAUDE.md"
+                path.write_text(body + f"Project {project}.\n", encoding="utf-8", newline="")
+                paths.append(path)
+
+            for path in paths:
+                with mock.patch.object(compress_mod, "call_claude", return_value="# Notes\n\nShort.\n"), \
+                     mock.patch.object(compress_mod, "validate") as v:
+                    v.return_value = mock.Mock(is_valid=True, errors=[], warnings=[])
+                    self.assertTrue(compress_mod.compress_file(path), f"{path} was refused")
+
+            backups = [
+                compress_mod.backup_dir_for(p.resolve()) / "CLAUDE.original.md" for p in paths
+            ]
+            self.assertNotEqual(backups[0], backups[1])
+            for path, backup in zip(paths, backups):
+                self.assertTrue(backup.exists())
+                # Each backup still holds ITS OWN project's uncompressed text.
+                self.assertIn(f"Project {path.parent.parent.name}.", backup.read_text(encoding="utf-8"))
+
+    def test_pre_rekey_backup_still_blocks_a_rerun(self):
+        """The #1351 rekey must not strand an existing backup: a file compressed
+        before the key changed has its only original under the old parent-name
+        path, and rerunning there would capture the compressed text as the new
+        'original'. The old location is refused, never overwritten or deleted."""
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as data_home, \
+             mock.patch.dict(os.environ, {"XDG_DATA_HOME": data_home, "LOCALAPPDATA": data_home}):
+            compressed_now = "# Notes\n\nShort.\n"
+            path = self._file_with(Path(tmp), compressed_now)
+            legacy = compress_mod.legacy_backup_dir_for(path.resolve()) / "task.original.md"
+            legacy.parent.mkdir(parents=True, exist_ok=True)
+            legacy.write_text("# Notes\n\nThe long uncompressed original.\n", encoding="utf-8")
+
+            out = io.StringIO()
+            with mock.patch.object(compress_mod, "call_claude") as call, \
+                 contextlib.redirect_stdout(out):
+                ok = compress_mod.compress_file(path)
+
+            self.assertFalse(ok)
+            call.assert_not_called()
+            self.assertEqual(path.read_text(encoding="utf-8"), compressed_now)
+            self.assertIn("The long uncompressed original.", legacy.read_text(encoding="utf-8"))
+            self.assertFalse(
+                (compress_mod.backup_dir_for(path.resolve()) / "task.original.md").exists()
+            )
+            message = out.getvalue()
+            # The old location was shared by every same-named file on the machine,
+            # so the message must flag that and must NOT offer to copy it over the
+            # live file — that backup may be a different project's original.
+            self.assertIn("possibly another project's", message)
+            self.assertNotIn(f"cp '{legacy}'", message)
+
     def test_empty_input_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._file_with(Path(tmp), "")
@@ -169,7 +231,7 @@ class CompressSafetyTests(unittest.TestCase):
 
     def _run_fix_pass(self, fix, fix_is_faithful=False):
         # The first candidate drops the URL, so the real validate() rejects it
-        # and `fix` (a whole file, as build_fix_prompt asks for) is the repair.
+        # and `fix` (a body only, as build_fix_prompt asks for) is the repair.
         original = (
             "---\n"
             "name: deploy-notes\n"
@@ -193,14 +255,15 @@ class CompressSafetyTests(unittest.TestCase):
              tempfile.TemporaryDirectory() as data_home, \
              mock.patch.dict(os.environ, {"XDG_DATA_HOME": data_home, "LOCALAPPDATA": data_home}):
             path = self._file_with(Path(tmp), original)
-            repair = fix(original.replace(
+            frontmatter, _ = compress_mod.split_frontmatter(original)
+            repair = fix(body.replace(
                 "Some prose about the deploy process that is fairly verbose and wordy.", "Deploy prose."
             ))
             with mock.patch.object(compress_mod, "call_claude", side_effect=[first, repair]):
                 ok = compress_mod.compress_file(path)
             if fix_is_faithful:
                 self.assertTrue(ok)
-                self.assertEqual(path.read_text(encoding="utf-8"), repair)
+                self.assertEqual(path.read_text(encoding="utf-8"), frontmatter + repair)
                 return
             self.assertFalse(ok)
             self.assertEqual(path.read_text(encoding="utf-8"), original)
@@ -218,11 +281,8 @@ class CompressSafetyTests(unittest.TestCase):
         self._run_fix_pass(lambda text: text.replace("-n prod", "-n dev"))
 
     def test_fix_pass_cannot_rewrite_frontmatter(self):
-        # The first pass strips frontmatter before the model sees it; the fix
-        # prompt sends the whole file, and validate() never compares it.
-        self._run_fix_pass(lambda text: text.replace(
-            "Notes for deploying the service to production safely.", "deploy notes prod."
-        ))
+        # Frontmatter is local-only; this heading-first case rejects at the anchor guard.
+        self._run_fix_pass(lambda text: "---\nname: changed\n---\n" + text)
 
     def test_real_compression_writes_backup_and_target(self):
         # Isolate the backup data dir to a temp location so the out-of-tree
@@ -521,6 +581,105 @@ class CompressSafetyTests(unittest.TestCase):
         self.assertTrue(compress_mod.is_sensitive_path(Path("project/private_keys/service-notes.md")))
         self.assertFalse(compress_mod.is_sensitive_path(Path("project/docs/service-notes.md")))
 
+    def test_credential_dotfiles_are_blocked(self):
+        for name in (".npmrc", ".pypirc", ".pgpass", ".git-credentials", ".htpasswd", ".s3cfg", ".boto"):
+            with self.subTest(name=name):
+                self.assertTrue(compress_mod.is_sensitive_path(Path("home/user") / name))
+        self.assertFalse(compress_mod.is_sensitive_path(Path("project/.cursorrules")))
+
+    def test_ssh_key_file_names_stay_blocked(self):
+        # #1464 respelled `authorized_keys` in the refuse-list as a character
+        # class; it must still refuse exactly the same names, and no more.
+        for name in ("authorized_keys", "known_hosts", "id_rsa", "id_ed25519.pub"):
+            with self.subTest(name=name):
+                self.assertTrue(compress_mod.SENSITIVE_BASENAME_REGEX.match(name))
+        for name in ("authorized_key", "authorized_keyss", "authorized_keys.md"):
+            with self.subTest(name=name):
+                self.assertIsNone(compress_mod.SENSITIVE_BASENAME_REGEX.match(name))
+
+    # Built at run time so this file never holds a key-shaped literal that
+    # secret scanners (or GitHub push protection) would flag.
+    FAKE_CREDENTIALS = {
+        "private key block": "-----BEGIN " + "OPENSSH PRIVATE KEY" + "-----",
+        "AWS access key": "AKIA" + "Q7XK2M9WZ4HB3N5T",
+        "GitHub token": "gh" + "p_" + "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3z5A",
+        "GitLab token": "gl" + "pat-" + "x7Kq2Lm9Np4Rs6Tv8Wz1",
+        "Anthropic API key": "sk-" + "ant-api03-" + "Zq8" * 12,
+        "OpenAI API key": "sk-" + "proj-" + "Hq7Lw2" * 8,
+        "Slack token": "xo" + "xb-" + "1234567890-abcdefghij",
+        "Google API key": "AI" + "za" + "SyD3fG5hJ7kL9mN1pQ3rS5tU7vW9xY1zA3b",
+        "Stripe live key": "sk" + "_live_" + "4eC39HqLyjWDarjtT1zdp7dc",
+        "npm token": "np" + "m_" + "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3z5A",
+    }
+
+    def test_credential_in_text_refused_before_anything_is_sent(self):
+        for kind, secret in self.FAKE_CREDENTIALS.items():
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                text = f"# Deploy notes\n\nUse the staging box.\nkey: {secret}\nThen run tests.\n"
+                path = self._file_with(Path(tmp), text)
+                with mock.patch.object(compress_mod, "call_claude") as call:
+                    with self.assertRaises(ValueError) as ctx:
+                        compress_mod.compress_file(path)
+                call.assert_not_called()
+                message = str(ctx.exception)
+                self.assertIn("line 4", message)
+                self.assertIn(kind, message)
+                self.assertNotIn(secret, message)
+                self.assertEqual(path.read_text(encoding="utf-8"), text)
+                backup_dir = compress_mod.backup_dir_for(path)
+                self.assertFalse((backup_dir / "task.original.md").exists())
+
+    def test_credential_placeholders_do_not_trip_the_refusal(self):
+        placeholders = (
+            "Set `OPENAI_API_KEY=sk-...` in your shell, never in this file.",
+            "Export $ANTHROPIC_API_KEY and $AWS_ACCESS_KEY_ID before running.",
+            "Tokens look like `ghp_xxxx` or `sk-ant-...`; rotate them monthly.",
+            "Paste the -----BEGIN PUBLIC KEY----- block into the deploy form.",
+            "AKIA prefixes mark AWS key ids; xoxb- marks Slack bot tokens.",
+            "See https://example.com/docs/sk-live-mode for Stripe test mode.",
+        )
+        for line in placeholders:
+            with self.subTest(line=line):
+                self.assertIsNone(compress_mod.find_credential(f"# Notes\n\n{line}\n"))
+
+    def test_html_comments_are_masked_before_model_and_restored_byte_exact(self):
+        # #1350: a comment that starts a line reached the model, which could
+        # drop or reword it while validation, never counting comments, passed.
+        original = (
+            "# Notes\n\n<!-- keep: owned by the release script -->\nProse one.\n\n"
+            "<!--\nmulti-line note\nfor the next editor\n-->\n\n"
+            "Prose two with an inline <!-- x --> tail.\n"
+        )
+        masked, blocks = compress_mod.mask_code_blocks(original)
+        self.assertNotIn("owned by the release script", masked)
+        self.assertNotIn("for the next editor", masked)
+        self.assertIn("inline <!-- x --> tail", masked)  # mid-line HTML is prose
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(compress_mod.restore_code_blocks(masked, blocks), original)
+
+    def test_unclosed_html_comment_is_preserved_to_the_end(self):
+        original = "# Notes\n\nProse.\n<!-- open\nstill comment\n"
+        masked, blocks = compress_mod.mask_code_blocks(original)
+        self.assertEqual(len(blocks), 1)
+        self.assertNotIn("still comment", masked)
+        self.assertEqual(compress_mod.restore_code_blocks(masked, blocks), original)
+
+    def test_validation_warnings_are_shown_after_a_pass(self):
+        # #1350: warnings were computed and never printed.
+        with tempfile.TemporaryDirectory() as tmp, \
+             tempfile.TemporaryDirectory() as data_home, \
+             mock.patch.dict(os.environ, {"XDG_DATA_HOME": data_home, "LOCALAPPDATA": data_home}):
+            path = self._file_with(Path(tmp), "# Heading\n\nThe quick brown fox jumps over the lazy dog.\n")
+            out = io.StringIO()
+            with mock.patch.object(compress_mod, "call_claude", return_value="# Heading\n\nFox jump dog.\n"), \
+                 mock.patch.object(compress_mod, "validate") as v, \
+                 contextlib.redirect_stdout(out):
+                v.return_value = mock.Mock(
+                    is_valid=True, errors=[], warnings=["Bullet count changed too much: 8 -> 3"]
+                )
+                self.assertTrue(compress_mod.compress_file(path))
+            self.assertIn("Bullet count changed too much: 8 -> 3", out.getvalue())
+
     def test_code_blocks_are_masked_before_model_and_restored_byte_exact(self):
         original = (
             "# Tree\n\nProse before.\n\n"
@@ -639,6 +798,27 @@ class CompressSafetyTests(unittest.TestCase):
         config = json.loads(run.call_args.kwargs["env"]["OPENCODE_CONFIG_CONTENT"])
         self.assertEqual(config["permission"], {"*": "deny"})
         self.assertEqual(config["model"], "x/y")  # user's inline config kept
+
+    def test_opencode_child_inherits_the_caller_environment(self):
+        # opencode needs PATH, HOME and provider credentials from the caller;
+        # compress only adds its deny config on top.
+        completed = mock.Mock(stdout=OPENCODE_OUTPUT)
+        with llm_env(CAVEMAN_COMPRESS_PROVIDER=OPENCODE_PROVIDER), \
+             mock.patch.dict(os.environ, {"CAVEMAN_TEST_INHERITED": "kept"}), \
+             mock.patch.object(compress_mod.subprocess, "run", return_value=completed) as run:
+            compress_mod.call_claude(PROMPT_TEXT)
+
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["CAVEMAN_TEST_INHERITED"], "kept")
+        self.assertIn("OPENCODE_CONFIG_CONTENT", env)
+
+    def test_claude_cli_child_gets_no_env_override(self):
+        completed = mock.Mock(stdout=CLAUDE_OUTPUT)
+        with llm_env(), \
+             mock.patch.object(compress_mod.shutil, "which", return_value=CLAUDE_BIN), \
+             mock.patch.object(compress_mod.subprocess, "run", return_value=completed) as run:
+            compress_mod.call_claude(PROMPT_TEXT)
+        self.assertNotIn("env", run.call_args.kwargs)
 
     def test_opencode_runs_a_dedicated_deny_all_agent(self):
         # opencode applies a per-agent rule after the global one and the last

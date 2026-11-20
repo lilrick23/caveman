@@ -274,8 +274,12 @@ test('standalone hooks keep a stable PATH node symlink', { skip: process.platfor
   const upgradedCellarNode = path.join(upgradedCellarBin, 'node');
   const stableNode = path.join(stableBin, 'node');
 
+  // The versioned "Cellar" nodes are symlinks to this node, not hard links: a
+  // dynamically linked node (Homebrew's loads libnode from ../lib) cannot start
+  // from another directory, so a linked copy aborted before the installer ran
+  // and settings.json was never written.
   try {
-    fs.linkSync(process.execPath, cellarNode);
+    fs.symlinkSync(process.execPath, cellarNode);
     fs.symlinkSync(cellarNode, stableNode);
     const r = spawnSync(stableNode, [
       INSTALLER, '--only', 'claude', '--with-hooks', '--skip-skills',
@@ -284,6 +288,7 @@ test('standalone hooks keep a stable PATH node symlink', { skip: process.platfor
       env: { ...isolatedEnv(path.join(dir, 'home')), PATH: stableBin, CLAUDE_CONFIG_DIR: configDir },
       encoding: 'utf8',
     });
+    assert.ok(!r.error && !r.signal, `installer did not run: ${r.error?.message || r.signal} ${r.stderr}`);
     assert.notEqual(r.status, 2, `installer aborted on argv parse: ${r.stderr}`);
 
     const settings = JSON.parse(fs.readFileSync(path.join(configDir, 'settings.json'), 'utf8'));
@@ -292,8 +297,10 @@ test('standalone hooks keep a stable PATH node symlink', { skip: process.platfor
       'hook command should preserve the stable node path found on PATH');
     assert.doesNotMatch(command, new RegExp(cellarNode.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
       'hook command must not persist the versioned node target');
+    assert.ok(!command.includes(`"${fs.realpathSync(process.execPath)}"`),
+      'hook command must not persist the resolved node binary');
 
-    fs.linkSync(process.execPath, upgradedCellarNode);
+    fs.symlinkSync(process.execPath, upgradedCellarNode);
     fs.unlinkSync(stableNode);
     fs.symlinkSync(upgradedCellarNode, stableNode);
     fs.rmSync(path.join(dir, 'Cellar', 'node', '26.5.0'), { recursive: true });
@@ -303,6 +310,37 @@ test('standalone hooks keep a stable PATH node symlink', { skip: process.platfor
     const upgraded = spawnSync(storedNode, ['--version'], { encoding: 'utf8' });
     assert.equal(upgraded.status, 0,
       `stored hook executable should survive a Node upgrade: ${upgraded.error?.message || upgraded.stderr}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// #1452: `--hook-node node` writes every Claude hook with bare `node`, found
+// through the hook's PATH when it runs. Re-running without the flag goes back
+// to the absolute install-time node, replacing each entry in place.
+test('--hook-node node writes PATH-resolved Claude hooks; a plain re-run pins again', () => {
+  const dir = freshTmpDir();
+  const configDir = path.join(dir, 'claude');
+  const env = isolatedInstallEnv(dir);
+  const events = [['SessionStart', 'caveman-activate'], ['SubagentStart', 'caveman-activate'],
+    ['UserPromptSubmit', 'caveman-mode-tracker'], ['SessionEnd', 'caveman-stats']];
+  try {
+    const portable = runInstaller(['--only', 'claude', '--with-hooks', '--hook-node', 'node'], configDir, env);
+    assert.equal(portable.status, 0, portable.stderr || portable.stdout);
+    let settings = JSON.parse(fs.readFileSync(path.join(configDir, 'settings.json'), 'utf8'));
+    for (const [event, marker] of events) {
+      const commands = cavemanHookCommands(settings, event, marker);
+      assert.equal(commands.length, 1, `${event}: ${JSON.stringify(commands)}`);
+      assert.ok(commands[0].command.startsWith('"node" "'), `${event}: ${commands[0].command}`);
+    }
+    const pinned = runInstaller(['--only', 'claude', '--with-hooks'], configDir, env);
+    assert.equal(pinned.status, 0, pinned.stderr || pinned.stdout);
+    settings = JSON.parse(fs.readFileSync(path.join(configDir, 'settings.json'), 'utf8'));
+    for (const [event, marker] of events) {
+      const commands = cavemanHookCommands(settings, event, marker);
+      assert.equal(commands.length, 1, `${event} duplicated: ${JSON.stringify(commands)}`);
+      assert.ok(!commands[0].command.startsWith('"node" "'), `${event} stayed bare: ${commands[0].command}`);
+    }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

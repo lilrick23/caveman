@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -311,4 +312,53 @@ func (e *subprocErr) Error() string {
 
 func fmtFact(i int) string {
 	return "subprocess memory number " + strconv.Itoa(i) + " about distinct topic " + strconv.Itoa(i)
+}
+
+func TestSupersedeReadsReplacementFromStdinAndMapsTooLargeExit(t *testing.T) {
+	store, err := mem.Open(mem.Options{InMemory: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	old, err := store.Remember("deploy key is in vault")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if code := handleArgs(store, []string{"supersede", old.ID, "--stdin"}, strings.NewReader("deploy key moved"), &out, &errOut); code != 0 {
+		t.Fatalf("supersede --stdin exit %d: %s", code, errOut.String())
+	}
+	current, err := store.Remember("deploy key moved")
+	if err != nil || current.ID == "" {
+		t.Fatalf("replacement was not stored: %v", err)
+	}
+	out.Reset()
+	errOut.Reset()
+	huge := strings.NewReader(strings.Repeat("x", mem.MaxMemoryBytes+1))
+	if code := handleArgs(store, []string{"supersede", current.ID, "--stdin"}, huge, &out, &errOut); code != memoryTooLargeExitCode {
+		t.Fatalf("oversized supersede exit %d, want %d", code, memoryTooLargeExitCode)
+	}
+}
+
+func TestVersionAdvertisesSupersedeStdin(t *testing.T) {
+	// Clients branch on this list: a build that reads a replacement from stdin
+	// must say so, because one that does not treats supersede's second argument
+	// as the replacement text and would store a literal "--stdin".
+	var out bytes.Buffer
+	runVersion([]string{"--json"}, &out)
+	var payload struct {
+		Schema       string   `json:"schema"`
+		Capabilities []string `json:"capabilities"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("version --json is not JSON: %v (%s)", err, out.String())
+	}
+	if payload.Schema != "caveman.mem.version.v1" {
+		t.Fatalf("schema = %q", payload.Schema)
+	}
+	for _, want := range []string{"supersede", "supersede-stdin"} {
+		if !slices.Contains(payload.Capabilities, want) {
+			t.Fatalf("capabilities %v missing %q", payload.Capabilities, want)
+		}
+	}
 }

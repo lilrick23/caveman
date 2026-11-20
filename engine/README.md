@@ -72,13 +72,16 @@ Commands reading stdin enforce a 64 MiB input limit and fail with
 
 Persistent CCR storage retains at most 512 MiB of payloads by default. Set
 `CAVEMAN_CCR_MAX_BYTES` to a positive byte count before startup to choose a
-different cap. At cap, new lossy transforms fail closed to original-byte
-pass-through; existing handles are never evicted and remain recoverable.
+different cap. At cap, a refused write first frees room by consolidating
+duplicate repository maps and expiring typed objects of long-ended sessions
+(see `docs/technical/context-recovery.md`); if nothing can be freed, new lossy
+transforms fail closed to original-byte pass-through. Blob handles are never
+evicted.
 
 Engine source ships under Apache-2.0, like the rest of the repository. See
 `LICENSE` and `../LICENSING.md`.
 
-Build/test inside this repository:
-`make product-build PRODUCT=engine` / `make product-test PRODUCT=engine`.
+Build and test from the repository root:
+`go build ./engine/...` and `go test ./engine/...`.
 
 Registry id: `engine`.

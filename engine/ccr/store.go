@@ -28,6 +28,10 @@ import (
 // guesses a recovery — an unknown handle is an explicit miss.
 var ErrNotFound = errors.New("ccr: recovery handle not found")
 
+// ErrCorruptRecovery is returned when stored bytes do not match their handle or
+// their content hash. The store never returns such bytes as a recovery.
+var ErrCorruptRecovery = errors.New("ccr: stored recovery data does not match its handle, so the store is damaged (run PRAGMA quick_check)")
+
 // ErrBudgetExceeded means a new recovery was refused before publishing lossy
 // bytes because the local store's configured payload budget would be exceeded.
 // Existing handles remain intact and retrievable; callers must pass through.
@@ -36,6 +40,18 @@ var ErrBudgetExceeded = errors.New("ccr: storage budget exceeded")
 // ErrStorageChanged means the recovery database no longer matches the open
 // connection. Callers must preserve the original input and report the error.
 var ErrStorageChanged = errors.New("ccr: recovery storage changed; restart the process and restore missing recovery files")
+
+// ErrStoreDamaged means PRAGMA quick_check, or SQLite itself, found damage in
+// the recovery database. Reads still work and are hash-checked, but every write
+// is refused: a write into a damaged b-tree can spread the damage. Callers
+// must pass the original input through.
+var ErrStoreDamaged = errors.New("ccr: recovery store is damaged; new recovery writes are refused until it is repaired (caveman-proxy recovery-store repair)")
+
+// ErrExpired is returned for a typed object the store deleted under its
+// retention policy. It wraps ErrNotFound, so a caller that only asks "is it
+// here" is unchanged, while a caller that reports to an agent can say the
+// reference expired rather than that it never existed.
+var ErrExpired = fmt.Errorf("%w: the object expired under the recovery store's retention policy and cannot be recovered", ErrNotFound)
 
 // ObjectType is a closed typed-working-memory enum. Unknown values fail closed:
 // adapters may preserve unknown native payloads outside CCR, but may not invent
@@ -212,12 +228,48 @@ type Stats struct {
 	StorageBytes    int64 `json:"storage_bytes,omitempty"`
 	MaxStorageBytes int64 `json:"max_storage_bytes,omitempty"`
 	StorageFull     bool  `json:"storage_full,omitempty"`
+	// StorageFullReason names why StorageFull is true: StorageFullPayloadBudget,
+	// StorageFullPageCap or StorageFullDiskFull. It is empty when not full.
+	StorageFullReason string `json:"storage_full_reason,omitempty"`
+	// Integrity is IntegrityOK or IntegrityDamaged once this process has
+	// checked the database, and empty before that. A damaged store refuses
+	// every write; IntegrityDetail carries the first quick_check findings.
+	Integrity       string `json:"integrity,omitempty"`
+	IntegrityDetail string `json:"integrity_detail,omitempty"`
 }
+
+// Values of Stats.Integrity.
+const (
+	IntegrityOK      = "ok"
+	IntegrityDamaged = "damaged"
+)
+
+// Values of Stats.StorageFullReason.
+const (
+	// StorageFullPayloadBudget means retained payload bytes reached the budget.
+	StorageFullPayloadBudget = "payload_budget"
+	// StorageFullPageCap means the database file reached its SQLite page cap.
+	// Indexes, overflow pages and unused space count toward the cap.
+	StorageFullPageCap = "page_cap"
+	// StorageFullDiskFull means a write failed with SQLITE_FULL while the
+	// file was below its page cap, so the disk or file system refused it.
+	StorageFullDiskFull = "disk_full"
+)
 
 // Handle returns the content-addressed handle for a payload without storing it.
 func Handle(original []byte) string {
 	sum := sha256.Sum256(original)
 	return "ccr_" + hex.EncodeToString(sum[:16])
+}
+
+// verifyObjectData checks that obj.Data still matches the content hash that
+// PutObject enforced at write time.
+func verifyObjectData(obj Object) error {
+	sum := sha256.Sum256(obj.Data)
+	if "sha256:"+hex.EncodeToString(sum[:]) != obj.ContentHash {
+		return fmt.Errorf("%w: object %s", ErrCorruptRecovery, obj.ID)
+	}
+	return nil
 }
 
 func ratio(before, after int) float64 {

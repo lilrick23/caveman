@@ -58,8 +58,11 @@ test('framework peers are optional and unranged (Decision 2); tested releases, m
   // C11: each entry is gated only on the packages it imports; nothing is gated on @langchain/langgraph.
   assert.deepEqual(inspectFrameworkCompatibility('langchain').frameworks.map(check => check.package), ['langchain', '@langchain/core']);
   assert.deepEqual(inspectFrameworkCompatibility('langchain-core').frameworks.map(check => check.package), ['@langchain/core']);
-  assert.equal(frameworkCompatible('@anthropic-ai/sdk', '0.133.0'), true, 'released 0.125-0.133 were tested');
-  assert.equal(frameworkCompatible('@anthropic-ai/sdk', '0.134.0'), false, 'zero-major next minor may break APIs');
+  assert.equal(frameworkCompatible('@anthropic-ai/sdk', '0.137.0'), true, 'released 0.125-0.137 were tested');
+  // Upstream closed the 0.x line at 0.137.0 by shipping 1.0.0, so this bound is the next major like every sibling's.
+  assert.equal(frameworkCompatible('@anthropic-ai/sdk', '1.0.0'), true, '1.0.0 was tested');
+  assert.equal(frameworkCompatible('@anthropic-ai/sdk', '1.1.0'), true, '1.1.0 was tested');
+  assert.equal(frameworkCompatible('@anthropic-ai/sdk', '2.0.0'), false, 'the next major may break APIs');
   assert.equal(frameworkCompatible('openai', '7.12.0'), false, 'older patch than validated floor');
   assert.throws(() => inspectFrameworkCompatibility('typo'), /Unknown Caveman adapter/);
 });
@@ -88,6 +91,26 @@ test('the version gate never throws at wrap time: warn once, decline for strict 
     // Every decline names its adapter in the warn-once line.
     assert.ok(!lines.some(line => line.includes('adapter=-')), lines.join('\n'));
     strict.close(); runtime.close(); conflict.close();
+  } finally { console.warn = warn; }
+});
+
+test('a version below the floor is told to upgrade; one above the range is not', () => {
+  const lines = [], warn = console.warn;
+  console.warn = line => lines.push(line);
+  try {
+    const { runtime } = runtimeFixture({ strict: true });
+    // 1.30.x was the floor before GHSA-6prh-2h8m-c8cw; it now declines, and a line says what to install.
+    assert.equal(frameworkGate('mcp', { runtime }, undefined, { '@modelcontextprotocol/sdk': '1.30.1' }), 'unsupported_version');
+    assert.equal(frameworkGate('mcp', { runtime }, undefined, { '@modelcontextprotocol/sdk': '1.30.1' }), 'unsupported_version');
+    const advice = lines.filter(line => line.includes('upgrade @modelcontextprotocol/sdk'));
+    assert.deepEqual(advice, ['Caveman middleware: @modelcontextprotocol/sdk 1.30.1 is older than the supported floor; upgrade @modelcontextprotocol/sdk to 1.32.0 or later (earlier HTTP transports re-send custom headers, such as credentials, and request bodies across cross-origin redirects (GHSA-6prh-2h8m-c8cw)). Until then the mcp adapter passes content through unchanged.'], 'advised once');
+    // The standard pass-through line keeps its shape and still appears exactly once.
+    assert.equal(lines.filter(line => line.includes('adapter=mcp reason=unsupported_version')).length, 1, lines.join('\n'));
+    assert.equal(frameworkGate('mcp', { runtime }, undefined, { '@modelcontextprotocol/sdk': '1.32.0' }), null, 'the patched floor runs');
+    // Above the range there is nothing to upgrade to: the decline keeps the generic pass-through line.
+    assert.equal(frameworkGate('openai', { runtime }, undefined, { openai: '9.0.0' }), 'unsupported_version');
+    assert.ok(!lines.some(line => line.includes('upgrade openai')), lines.join('\n'));
+    runtime.close();
   } finally { console.warn = warn; }
 });
 
@@ -174,7 +197,9 @@ test('check-latest-in-range reads every TypeScript and Python range and flags on
   const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
   const entries = await ranges();
   assert.deepEqual(entries.filter(([registry]) => registry === 'npm').map(([, name]) => name), Object.keys(pkg.supportedFrameworkVersions));
-  assert.deepEqual(entries.find(([registry, name]) => registry === 'pypi' && name === 'anthropic'), ['pypi', 'anthropic', '1.0', '2']);
+  // Upper bound tracks _versions.py, which admitted the Anthropic Python SDK's
+  // 1.x line when upstream shipped it; ranges() reads that file, not this literal.
+  assert.deepEqual(entries.find(([registry, name]) => registry === 'pypi' && name === 'anthropic'), ['pypi', 'anthropic', '1.0', '3']);
   assert.ok(entries.some(([registry, name]) => registry === 'pypi' && name === 'autogen-ext'));
   const sample = [['npm', '@anthropic-ai/sdk', '0.124.0', '0.129'], ['pypi', 'openai', '2.20', '4'], ['npm', 'openai', '7.12.1', '8']];
   assert.deepEqual(drift(sample, { 'npm:@anthropic-ai/sdk': '0.128.0', 'pypi:openai': '3.9.1', 'npm:openai': '7.23.0' }), []);

@@ -251,8 +251,9 @@ runtime events, but opted-in telemetry needs `CAVEMAN_TELEMETRY=0` or
 
 ## Local storage
 
-Caveman stores runtime data under `~/.caveman/` and account/config state under
-`~/.caveman-cloud/` unless a documented environment override changes a path.
+Caveman stores runtime data and CLI configuration under `~/.caveman/`
+(`CAVEMAN_HOME`), and scan sync state under `~/.caveman-cloud/`, unless a
+documented environment override changes a path.
 Important files include:
 
 - `~/.caveman/caveman.db`: per-request metadata, usage, local savings estimates,
@@ -267,8 +268,10 @@ Important files include:
 - local learn/first-run scans read supported Claude Code and Codex history files
   and write aggregate reports/state locally. Raw session content is not included
   in CLI telemetry or authenticated scan sync.
-- `~/.caveman-cloud/config.json`: endpoints, project/account pointers, telemetry
-  decision, and other CLI state.
+- `~/.caveman/cloud.json`: endpoints, project/account pointers, telemetry
+  decision, and other CLI state. Older CLIs used `~/.caveman-cloud/config.json`;
+  the current CLI copies it once, leaves it in place, and mirrors its own
+  setting changes into it while it exists.
 - account credentials: macOS Keychain when available, otherwise
   `~/.caveman/credentials` with file mode `0600`. `CAVE_TOKEN` remains owned by
   the parent environment.
@@ -276,9 +279,15 @@ Important files include:
 CCR SQLite files and sidecars are created or tightened to mode `0600` and refuse
 unsafe symlink/non-regular-file paths. This is filesystem access control, not
 database encryption. Default retained CCR payload budget is 512 MiB;
-`CAVEMAN_CCR_MAX_BYTES` can change it. Existing recovery handles are never
-evicted. When the budget is exhausted, new recovery writes fail and lossy
-transforms must fall back to pass-through.
+`CAVEMAN_CCR_MAX_BYTES` can change it. Blob recovery handles (`ccr_…`) are
+never evicted. When the store is full, a refused write first frees room by
+consolidating duplicate repository maps, then by expiring typed objects
+(`ccr://ccr_obj_…`) of sessions that ended 14+ days ago or have been idle 30+
+days, oldest first; each expiry is logged and the id then answers "expired".
+If nothing can be freed, new recovery writes fail and lossy transforms fall
+back to pass-through. A store that fails `PRAGMA quick_check` refuses every
+write; `caveman-proxy recovery-store repair` rebuilds it from every row that
+still matches its hash and keeps the damaged files as a backup.
 
 Uninstall removes installed integrations and hooks. Do not assume it erases
 runtime databases, reports, backups, or credentials; inspect `~/.caveman/` and

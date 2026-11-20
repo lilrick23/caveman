@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -30,6 +31,7 @@ import (
 	"github.com/JuliusBrussee/caveman/shared/platform/httpx"
 	"github.com/JuliusBrussee/caveman/shared/platform/id"
 	"github.com/JuliusBrussee/caveman/shared/platform/redact"
+	"github.com/JuliusBrussee/caveman/shared/platform/ssrf"
 )
 
 // doUpstream retries only connection-setup failures: the provider has not received a request.
@@ -46,6 +48,18 @@ func (s *Server) doUpstream(ctx context.Context, build func() (*http.Request, er
 		if err == nil {
 			return resp, nil
 		}
+		if ssrf.IsBlocked(err) {
+			// The dial guard refused the destination: nothing left the
+			// machine, a retry would be refused the same way, and the caller
+			// only sees a 502. Without this line a refused upstream (a compat
+			// mount on a loopback relay, #1440) looked exactly like an outage.
+			// The guard's message names the host and, where an allowlist can
+			// help, the CAVE_SSRF_ALLOWLIST entry.
+			if s.logger != nil {
+				s.logger.Warn("upstream destination refused by the SSRF guard; this is policy, not an outage", "host", req.URL.Host, "error", redact.Error(err))
+			}
+			return nil, err
+		}
 		if attempt >= 2 || ctx.Err() != nil || !connectionSetupFailure(err) {
 			return nil, err
 		}
@@ -58,6 +72,16 @@ func (s *Server) doUpstream(ctx context.Context, build func() (*http.Request, er
 		case <-time.After(time.Duration(attempt+1) * 200 * time.Millisecond):
 		}
 	}
+}
+
+// upstreamFailureCode is the error code for an upstream attempt that returned
+// no response: a guard refusal is named as one, so neither the client nor the
+// spend row reads it as the provider being down (#1440).
+func upstreamFailureCode(err error) string {
+	if ssrf.IsBlocked(err) {
+		return "cave_upstream_blocked"
+	}
+	return "cave_upstream_unavailable"
 }
 
 // connectionSetupFailure reports whether err ended the attempt while the
@@ -137,6 +161,12 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	// and before matchAdapter because that allowlist is POST-only (issue #1187).
 	if adapter := s.matchMetadataAdapter(r); adapter != nil {
 		s.metadataPassthrough(w, r, adapter, s.creds.Resolve(adapter.Name(), r), requestID)
+		return
+	}
+	// The OAuth token refresh shares the agent's base URL but is no inference
+	// either, so it gets the same treatment, without a provider credential.
+	if adapter := s.matchOAuthTokenAdapter(r); adapter != nil {
+		s.oauthTokenPassthrough(w, r, adapter, requestID)
 		return
 	}
 	adapter := s.matchAdapter(r)
@@ -666,9 +696,10 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		if meta.Model != modelRequested && r.Context().Err() == nil {
 			evidence.route.reject(false) // the agent's own retry goes to the asked model
 		}
-		httpx.Error(w, r, http.StatusBadGateway, "cave_upstream_unavailable", "Upstream provider unavailable.")
+		code := upstreamFailureCode(err)
+		httpx.Error(w, r, http.StatusBadGateway, code, "Upstream provider unavailable.")
 		estimateWG.Wait() // join the observe estimate before record() reads it
-		s.record(start, 0, requestID, traceID, rc, meta, authMode, http.StatusBadGateway, 0, len(body), rawHash, transformedHash, "cave_upstream_unavailable", transform.OptimizerIDs, providers.UsageObservation{CacheStatus: "unknown"}, comp, toolSchemaHandle, false, estimate, evidence, providerCachePrefixSHA256, providerCacheComponentSHA256, cacheBoundaryKnown, cacheBustCause, compressionEligible)
+		s.record(start, 0, requestID, traceID, rc, meta, authMode, http.StatusBadGateway, 0, len(body), rawHash, transformedHash, code, transform.OptimizerIDs, providers.UsageObservation{CacheStatus: "unknown"}, comp, toolSchemaHandle, false, estimate, evidence, providerCachePrefixSHA256, providerCacheComponentSHA256, cacheBoundaryKnown, cacheBustCause, compressionEligible)
 		return
 	}
 	// A 400 naming the thinking binding or the per-message marks earns one heal
@@ -788,10 +819,11 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		retryResp, derr := s.doUpstream(r.Context(), buildUpstream(original, retryHeaders))
 		s.inflight.Add(-1)
 		if derr != nil {
-			httpx.Error(w, r, http.StatusBadGateway, "cave_upstream_unavailable", "Upstream provider unavailable.")
+			code := upstreamFailureCode(derr)
+			httpx.Error(w, r, http.StatusBadGateway, code, "Upstream provider unavailable.")
 			estimateWG.Wait() // join the observe estimate; passed uniformly (zeroed at Record on this failed status)
 			evidence.acceptedBody = original
-			s.record(start, 0, requestID, traceID, rc, meta, authMode, http.StatusBadGateway, 0, len(body), rawHash, originalHash, "cave_upstream_unavailable", []string{}, providers.UsageObservation{CacheStatus: "unknown"}, nil, "", false, estimate, evidence, providerCachePrefixSHA256, providerCacheComponentSHA256, cacheBoundaryKnown, cacheBustCause, compressionEligible)
+			s.record(start, 0, requestID, traceID, rc, meta, authMode, http.StatusBadGateway, 0, len(body), rawHash, originalHash, code, []string{}, providers.UsageObservation{CacheStatus: "unknown"}, nil, "", false, estimate, evidence, providerCachePrefixSHA256, providerCacheComponentSHA256, cacheBoundaryKnown, cacheBustCause, compressionEligible)
 			return
 		}
 		retryServed := retryResp.StatusCode >= 200 && retryResp.StatusCode < 300
@@ -1347,6 +1379,46 @@ type estimateOutcome struct {
 	after  int
 }
 
+// safeEngineCall runs one engine transform for one segment and converts a panic
+// into a decline. The engine is a separate product reached through the
+// Compressor seam, and a defect there is reachable by payload shape alone:
+// #1508's whitespace-only listing body panicked inside unwrapFileWrapper, which
+// unwound the whole handler. net/http recovered so the process survived, but the
+// client connection closed with no response, nothing went upstream, and no row
+// or log line was written — invisible under `caveman wrap`, where stderr goes to
+// /dev/null. Every retry failed the same way because the block stayed in the
+// live zone, so the conversation could not recover.
+//
+// A decline is already a first-class outcome on both loops (out == nil keeps the
+// block raw, tb <= 0 skips the estimate), so recovering here lands the request on
+// the documented byte-safe fail-open path instead of dropping it. It is a
+// backstop for a defect, not an excuse for one: the panic is logged at error so
+// it stays findable, and the guard is per segment, so one bad block never costs
+// the rest of the request its compression.
+func (s *Server) safeEngineCall(what, requestID string, run func() ([]byte, int, int)) (out []byte, before, after int) {
+	defer func() {
+		if v := recover(); v != nil {
+			// http.ErrAbortHandler is deliberate control flow, not a defect:
+			// net/http uses it to drop a connection without logging. Absorbing
+			// it would turn an intended abort into a silent success, so it is
+			// re-raised untouched. The engine seam has no business raising it;
+			// this is here so a future caller on this path cannot be silenced.
+			if v == http.ErrAbortHandler {
+				panic(v)
+			}
+			out, before, after = nil, 0, 0
+			if s.logger != nil {
+				s.logger.Error("engine panic recovered; segment left unchanged",
+					"call", what,
+					"panic", fmt.Sprint(v),
+					"request_id", requestID,
+					"stack", string(debug.Stack()))
+			}
+		}
+	}()
+	return run()
+}
+
 // estimateRequest measures how many tokens compression would have removed from the
 // live-zone segments of a request, WITHOUT altering the forwarded bytes and WITHOUT
 // storing any CCR original. It runs only through the Estimator (engine Simulate)
@@ -1367,12 +1439,14 @@ func (s *Server) estimateRequest(adapter providers.Adapter, body []byte, meta pr
 	var before, after int
 	for _, seg := range segments {
 		cp := append([]byte(nil), seg...) // never let the estimator alias forwarded bytes
-		tb, ta := 0, 0
-		if queryAware && query != "" {
-			tb, ta = queryEst.EstimateSegmentQuery(cp, query)
-		} else {
-			tb, ta = est.EstimateSegment(cp)
-		}
+		_, tb, ta := s.safeEngineCall("estimate", "", func() ([]byte, int, int) {
+			if queryAware && query != "" {
+				b, a := queryEst.EstimateSegmentQuery(cp, query)
+				return nil, b, a
+			}
+			b, a := est.EstimateSegment(cp)
+			return nil, b, a
+		})
 		if tb <= 0 || ta >= tb {
 			continue
 		}
@@ -1628,20 +1702,20 @@ func (s *Server) rewriteRequest(
 			keepRaw(i, cacheScope)
 			continue
 		}
-		out, tb, ta := []byte(nil), 0, 0
-		if len(lockedRoutes) > 0 {
-			routeIndex := routeByBlock[i]
-			if routeIndex < 0 {
-				continue
-			}
-			route := lockedRoutes[routeIndex]
-			typed := s.compressor.(TypedCompressor)
-			out, tb, ta = typed.CompressSegmentType(block.content, route.ContentType)
-		} else if queryAware && query != "" {
-			out, tb, ta = queryComp.CompressSegmentQuery(block.content, query)
-		} else {
-			out, tb, ta = s.compressor.CompressSegment(block.content)
+		if len(lockedRoutes) > 0 && routeByBlock[i] < 0 {
+			continue
 		}
+		out, tb, ta := s.safeEngineCall("compress", requestID, func() ([]byte, int, int) {
+			if len(lockedRoutes) > 0 {
+				route := lockedRoutes[routeByBlock[i]]
+				typed := s.compressor.(TypedCompressor)
+				return typed.CompressSegmentType(block.content, route.ContentType)
+			}
+			if queryAware && query != "" {
+				return queryComp.CompressSegmentQuery(block.content, query)
+			}
+			return s.compressor.CompressSegment(block.content)
+		})
 		if out == nil || tb <= 0 || ta >= tb {
 			keepRaw(i, cacheScope)
 			continue
@@ -2273,7 +2347,7 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, src io.R
 	counter := &countingWriter{w: w}
 	if _, err := copyFlush(counter, src, completion); err != nil {
 		if r.Context().Err() != nil && completion != nil && completion.terminalDelivered() {
-			// Pi closes the stream as soon as it has consumed response.completed.
+			// Pi or Codex closes the stream as soon as it has consumed response.completed.
 			// That cancellation is safe to accept only after the terminal frame
 			// was fully written to the client; every earlier interruption fails closed.
 			return counter, ""

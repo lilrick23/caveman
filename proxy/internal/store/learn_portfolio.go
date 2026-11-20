@@ -46,7 +46,7 @@ func learnSessionSources() []sessionSource {
 		codexSessionSource{root: codexRoot()},
 		geminiSessionSource{root: geminiRoot()},
 		opencodeSessionSource{root: opencodeRoot()},
-		piSessionSource{root: piRoot()},
+		newPiSessionSource(),
 		aiderSessionSource{root: aiderRoot()},
 	}
 }
@@ -190,13 +190,14 @@ func scanLearnSessionMetricsUntil(sourceSet map[string]bool, since time.Time, re
 					}
 					windows.add(event.ProviderKey, event.Model, event.ContextTotal)
 				}
-				for _, payload := range event.TextPayloads {
-					for _, block := range segmentBlocks(payload) {
-						if estimateTokens(block) < minBlockTokens {
-							continue
-						}
-						metric.Fingerprints[hashText(normalizeBlock(block))]++
+				// Same segmentation and the same injected-context rule as the
+				// miner (#1459), so portfolio attribution counts only blocks
+				// that can become a repaste sink.
+				for _, candidate := range minableBlocks(event.TextPayloads) {
+					if candidate.injected || estimateTokens(candidate.raw) < minBlockTokens {
+						continue
 					}
+					metric.Fingerprints[hashText(normalizeBlock(candidate.raw))]++
 				}
 			}, deadline)
 			metric.Dumbzone = windows.dumbzone(windows.turns)

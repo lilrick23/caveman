@@ -137,7 +137,7 @@ def verify_shipped_skills_are_documented() -> None:
 
     docs = "\n".join(
         (ROOT / name).read_text(encoding="utf-8")
-        for name in ("README.md", "CLAUDE.md")
+        for name in ("README.md", "AGENTS.md")
     )
     # Only count a skill as documented when it is named in a code span — a
     # path, a table cell, a slash command. A bare substring search over the
@@ -152,7 +152,7 @@ def verify_shipped_skills_are_documented() -> None:
     ensure(
         not undocumented,
         "these skills ship to users but are named in neither README.md nor "
-        f"CLAUDE.md: {', '.join(undocumented)}. Document them, or move them "
+        f"AGENTS.md: {', '.join(undocumented)}. Document them, or move them "
         "out of skills/ so they stop auto-installing.",
     )
 
@@ -466,6 +466,23 @@ def verify_powershell_static() -> None:
     )
     ensure("[CAVEMAN" in statusline_text, "caveman-statusline.ps1 missing badge output")
 
+    # uninstall.ps1's .bak probe deliberately runs a node that exits 1 whenever
+    # the backup holds the comments the rewrite dropped, and it does not abort:
+    # a non-zero there is the answer, not an error. `powershell.exe -File` on
+    # Windows PowerShell 5.1 -- still the default shell on Windows -- ends a
+    # script with the last native command's exit code, so a clean uninstall of a
+    # JSONC settings.json reported failure. Clearing $LASTEXITCODE does not fix
+    # it: that assignment updates the variable, not the engine state the process
+    # exit code comes from. Only an explicit `exit 0` does. pwsh 7 exits 0 either
+    # way, and every .ps1 case skips on the POSIX runners, so this grep is the
+    # only guard here.
+    ensure(
+        uninstall_text.rstrip().endswith("exit 0"),
+        "uninstall.ps1 must end with an explicit `exit 0`: it leaves a deliberate "
+        "non-zero native exit code behind, which Windows PowerShell 5.1 returns as "
+        "the script's status",
+    )
+
     # Parity anchors between the two statusline ports and the JS source of
     # truth. There is no PowerShell behavioral test on the POSIX runners, so
     # these greps are the only thing standing between a bash-only fix and a
@@ -576,7 +593,7 @@ def verify_python_text_io_encoding() -> None:
         "node_modules", ".git", ".venv", "venv", "__pycache__",
         "build", ".mypy_cache", "target", "dist",
     }
-    # Routed to other repositories by CLAUDE.md, or a CI-generated mirror of a
+    # Routed to other repositories, or a CI-generated mirror of a
     # source this check already covers — a violation there is not fixable from
     # this repo, so failing the build on one would only strand the next run.
     skip_prefixes = (
@@ -657,6 +674,56 @@ def verify_python_text_io_encoding() -> None:
         + ", ".join(offenders),
     )
     print(f"{scanned} Python sources checked; all text IO passes an explicit encoding")
+
+
+def verify_test_entrypoints() -> None:
+    """Every unittest file must run its whole suite when invoked directly.
+
+    `python3 tests/test_x.py` executes the module top to bottom, so an
+    `if __name__ == "__main__": unittest.main()` block placed anywhere but the
+    end runs before the classes below it are defined -- those tests silently
+    never run, and the file still exits 0. A file with TestCase classes and no
+    guard at all is worse: it runs nothing and reports nothing. Both shapes
+    have shipped here, so this is a build check rather than a convention.
+    """
+    section("Test Entrypoints")
+
+    checked = 0
+    for path in sorted((ROOT / "tests").glob("test_*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+        classes = [
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and any("TestCase" in ast.dump(base) for base in node.bases)
+        ]
+        if not classes:
+            continue
+        checked += 1
+
+        guards = [
+            node for node in tree.body
+            if isinstance(node, ast.If) and "__main__" in ast.dump(node.test)
+        ]
+        rel = path.relative_to(ROOT)
+        ensure(
+            guards,
+            f"{rel} defines TestCase classes but has no "
+            'if __name__ == "__main__": unittest.main() block, so running it '
+            "directly executes nothing and still exits 0",
+        )
+
+        guard_line = guards[0].lineno
+        stranded = [node.name for node in classes if node.lineno > guard_line]
+        ensure(
+            not stranded,
+            f"{rel}: unittest.main() at line {guard_line} runs before "
+            f"{len(stranded)} later TestCase class(es) are defined, so they "
+            f"never run on a direct invocation: {', '.join(stranded)}. "
+            "Move the __main__ block to the end of the file.",
+        )
+
+    print(f"Checked {checked} unittest files for a reachable entrypoint")
 
 
 def verify_compress_fixtures() -> None:
@@ -1045,7 +1112,7 @@ def verify_release_metadata() -> None:
     # Every published artifact carries LICENSE and NOTICE: npm packages list both
     # in `files`, Python packages in `license-files`.
     unpublished = {
-        "packages/device-auth", "mem/js", "shared/provider-catalog", "src/hooks",  # not published from here
+        "packages/device-auth", "mem/js", "src/hooks",  # not published from here
     }
     tracked = run(["git", "ls-files", "-z", "--", "*package.json", "*pyproject.toml"]).stdout.split("\0")
     missing = []
@@ -1155,6 +1222,54 @@ def verify_hidden_child_windows() -> None:
     print("Hidden child window checks OK")
 
 
+def verify_wrap_recovery_tool_name() -> None:
+    """The Go recovery allowlist must spell the wrap plugin's tool exactly (#1432).
+
+    `caveman wrap claude` registers the recovery MCP server inside an ephemeral
+    Claude Code plugin. Claude Code keys a plugin's MCP server as
+    `plugin:<plugin>:<server>`, then replaces every character outside
+    [A-Za-z0-9_-] with `_` to build `mcp__<server>__<tool>`. Nothing at runtime
+    ties that spelling to proxy/providers/adapter.go, and when the two drifted
+    apart a retrieve result stopped being exempt from recompression and the
+    agent was handed back the elision it was escaping. Renaming the plugin or
+    the server here must fail the build, not ship a dead allowlist entry.
+    """
+    section("Wrap recovery tool name")
+
+    cli = (ROOT / "packages/cli/src/index.ts").read_text(encoding="utf-8")
+    builder = cli.split("function buildClaudeEphemeralPlugin(", 1)
+    ensure(len(builder) == 2, "buildClaudeEphemeralPlugin not found in packages/cli/src/index.ts")
+    body = builder[1].split("\nfunction ", 1)[0]
+
+    plugin_match = re.search(r'name:\s*"([^"]+)"', body)
+    ensure(plugin_match is not None, "buildClaudeEphemeralPlugin declares no plugin name")
+    plugin_name = plugin_match.group(1)
+
+    server_match = re.search(r"mcpServers\.([A-Za-z0-9_]+)\s*=", body)
+    ensure(server_match is not None, "buildClaudeEphemeralPlugin registers no recovery MCP server")
+    server_name = server_match.group(1)
+
+    def sanitize(value: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_-]", "_", value)
+
+    expected = f"mcp__{sanitize(f'plugin:{plugin_name}:{server_name}')}__{sanitize('caveman_retrieve')}"
+
+    adapter = (ROOT / "proxy/providers/adapter.go").read_text(encoding="utf-8")
+    declared = re.search(r'claudeWrapRecoveryToolName\s*=\s*"([^"]+)"', adapter)
+    ensure(declared is not None, "proxy/providers/adapter.go declares no claudeWrapRecoveryToolName")
+    ensure(
+        declared.group(1) == expected,
+        "claudeWrapRecoveryToolName is "
+        f"{declared.group(1)!r} but plugin {plugin_name!r} + server {server_name!r} yields {expected!r}",
+    )
+    ensure(
+        "claudeWrapRecoveryToolName" in adapter.split("func IsRecoveryToolName(", 1)[-1],
+        "claudeWrapRecoveryToolName is declared but IsRecoveryToolName does not accept it",
+    )
+
+    print(f"  {plugin_name}/{server_name} -> {expected}")
+
+
 def main() -> int:
     checks = [
         verify_license_boundaries,
@@ -1169,9 +1284,11 @@ def main() -> int:
         verify_powershell_static,
         verify_hidden_child_windows,
         verify_python_text_io_encoding,
+        verify_test_entrypoints,
         verify_compress_fixtures,
         verify_compress_cli,
         verify_hook_install_flow,
+        verify_wrap_recovery_tool_name,
     ]
 
     try:

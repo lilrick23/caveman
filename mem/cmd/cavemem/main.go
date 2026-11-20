@@ -3,7 +3,7 @@
 //	cavemem [mcp]              run the MCP server over stdio (default)
 //	cavemem remember <text>|--stdin store a memory; print {id,...} JSON
 //	cavemem recall <query> [limit] [token_budget] recall memories; 0 budget means unlimited
-//	cavemem supersede <id> <text> replace a current memory, preserving history
+//	cavemem supersede <id> <text>|--stdin replace a current memory, preserving history
 //	cavemem history <id>      print oldest-to-newest memory versions
 //	cavemem forget <id>       delete a memory; print {forgotten:bool} JSON
 //	cavemem recover <handle>  write the byte-exact original for a recall hit to stdout
@@ -28,7 +28,7 @@ import (
 	"github.com/JuliusBrussee/caveman/mem"
 )
 
-const usage = "cavemem [mcp] | remember <text>|--stdin | recall <query> [limit] [token_budget] | supersede <id> <text> | history <id> | forget <id> | recover <handle> | version [--json]"
+const usage = "cavemem [mcp] | remember <text>|--stdin | recall <query> [limit] [token_budget] | supersede <id> <text>|--stdin | history <id> | forget <id> | recover <handle> | version [--json]"
 
 // EX_DATAERR: wrappers can branch on size refusal without parsing stderr.
 const memoryTooLargeExitCode = 65
@@ -44,7 +44,12 @@ func runVersion(args []string, stdout io.Writer) {
 		_ = json.NewEncoder(stdout).Encode(map[string]any{
 			"version":      version,
 			"schema":       "caveman.mem.version.v1",
-			"capabilities": []string{"mcp", "remember", "recall", "supersede", "history", "forget", "recover"},
+			// supersede-stdin is listed separately from "supersede" on purpose:
+			// a build without it treats supersede's second argument as the
+			// replacement TEXT, so a caller that sends "--stdin" to one stores
+			// the literal flag and expires the real memory. Callers must see
+			// this before sending a replacement over stdin.
+			"capabilities": []string{"mcp", "remember", "recall", "supersede", "supersede-stdin", "history", "forget", "recover"},
 		})
 		return
 	}
@@ -89,7 +94,7 @@ func handleArgs(store *mem.Store, args []string, stdin io.Reader, stdout, stderr
 	case "recall":
 		return cmdRecall(store, args[1:], stdout, stderr)
 	case "supersede":
-		return cmdSupersede(store, args[1:], stdout, stderr)
+		return cmdSupersede(store, args[1:], stdin, stdout, stderr)
 	case "history":
 		return cmdHistory(store, args[1:], stdout, stderr)
 	case "forget":
@@ -334,14 +339,30 @@ func externalTokenBudget(value *int) (int, error) {
 	return *value, nil
 }
 
-func cmdSupersede(store *mem.Store, args []string, stdout, stderr io.Writer) int {
+func cmdSupersede(store *mem.Store, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) < 2 {
-		fmt.Fprintln(stderr, "usage: cavemem supersede <id> <text>")
+		fmt.Fprintln(stderr, "usage: cavemem supersede <id> <text>|--stdin")
 		return 1
 	}
-	memory, err := store.Supersede(args[0], args[1])
+	text := args[1]
+	if text == "--stdin" {
+		if len(args) != 2 {
+			fmt.Fprintln(stderr, "usage: cavemem supersede <id> <text>|--stdin")
+			return 1
+		}
+		data, err := io.ReadAll(io.LimitReader(stdin, mem.MaxMemoryBytes+1))
+		if err != nil {
+			fmt.Fprintf(stderr, "supersede: read stdin: %v\n", err)
+			return 1
+		}
+		text = string(data)
+	}
+	memory, err := store.Supersede(args[0], text)
 	if err != nil {
 		fmt.Fprintf(stderr, "supersede: %v\n", err)
+		if errors.Is(err, mem.ErrMemoryTooLarge) {
+			return memoryTooLargeExitCode
+		}
 		return 1
 	}
 	writeJSON(stdout, map[string]any{

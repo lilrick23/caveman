@@ -190,6 +190,17 @@ func (s *Store) Remember(text string) (Memory, error) {
 		return Memory{}, fmt.Errorf("read back memory: %w", err)
 	}
 	if stored.ValidUntil != nil {
+		// A revert (A -> B -> A) stores the text again under a version-derived
+		// id, so the content-addressed id can name an expired row while an
+		// identical current one exists. Remembering a fact that IS current has
+		// to stay idempotent, and the message below would be false. Return that
+		// current row; the expired one is never revived.
+		var current Memory
+		if err := scanMemory(s.db.QueryRow(memorySelect+` WHERE text = ? AND valid_until IS NULL LIMIT 1`, text), &current); err == nil {
+			return current, nil
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return Memory{}, fmt.Errorf("read back memory: %w", err)
+		}
 		return Memory{}, fmt.Errorf("memory %s exists only as an expired historical version and cannot be re-remembered as current", stored.ID)
 	}
 	return stored, nil
@@ -197,7 +208,9 @@ func (s *Store) Remember(text string) (Memory, error) {
 
 // Supersede atomically replaces one current memory with a new current version.
 // The old row remains durable for history and byte-exact audit, but normal recall
-// excludes it. An already-expired or unknown id fails closed.
+// excludes it. An already-expired or unknown id fails closed. Replacing a memory
+// with the text of an earlier, expired version is allowed: the revert is stored
+// as a new version with a fresh id, so history stays a straight line.
 func (s *Store) Supersede(oldID, newText string) (Memory, error) {
 	if strings.TrimSpace(oldID) == "" {
 		return Memory{}, fmt.Errorf("supersede requires old memory id")
@@ -225,11 +238,20 @@ func (s *Store) Supersede(oldID, newText string) (Memory, error) {
 		return Memory{}, fmt.Errorf("replacement text is identical to current memory")
 	}
 	newID := memID(newText)
-	var exists int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM memories WHERE id = ?`, newID).Scan(&exists); err != nil {
+	exists, expired, err := memoryRowState(tx, newID)
+	if err != nil {
 		return Memory{}, fmt.Errorf("check replacement memory: %w", err)
 	}
-	if exists > 0 {
+	if exists && expired {
+		// Reverting to an earlier value (A -> B -> A) hashes to A's expired row.
+		// Reusing that row would close a loop in the lineage, so the new current
+		// version gets its own id, derived from the memory it replaces.
+		newID = memVersionID(newText, oldID)
+		if exists, _, err = memoryRowState(tx, newID); err != nil {
+			return Memory{}, fmt.Errorf("check replacement memory: %w", err)
+		}
+	}
+	if exists {
 		return Memory{}, fmt.Errorf("replacement memory %s already exists", newID)
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -704,6 +726,25 @@ func migrateMemorySchema(db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+// memoryRowState reports whether a row with id exists and, if so, whether it has
+// been expired by a supersession.
+func memoryRowState(tx *sql.Tx, id string) (exists, expired bool, err error) {
+	var validUntil sql.NullString
+	switch err := tx.QueryRow(`SELECT valid_until FROM memories WHERE id = ?`, id).Scan(&validUntil); err {
+	case nil:
+		return true, validUntil.Valid, nil
+	case sql.ErrNoRows:
+		return false, false, nil
+	default:
+		return false, false, err
+	}
+}
+
+// memVersionID is the id of a re-created version of text that replaced oldID.
+func memVersionID(text, oldID string) string {
+	return memID(text + "\x00supersedes:" + oldID)
 }
 
 func memID(text string) string {

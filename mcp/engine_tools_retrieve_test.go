@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/JuliusBrussee/caveman/engine"
+	"github.com/JuliusBrussee/caveman/engine/ccr"
 )
 
 // storeEngine is the slice of Engine the retrieve path needs, backed by a map of
@@ -110,6 +111,56 @@ func TestRetrieveQueryDoesNotChangeAfterManyCalls(t *testing.T) {
 		result := retrieveTool(eng, retrieveArgs("ccr_unknown", ""))
 		if !result.IsError || !strings.Contains(result.Content[0].Text, "cave_unknown_handle") {
 			t.Fatalf("unknown handle must always fail explicitly: %+v", result)
+		}
+	}
+}
+
+type corruptEngine struct{ storeEngine }
+
+func (e *corruptEngine) Retrieve(string) ([]byte, error) {
+	return nil, fmt.Errorf("retrieve: %w", ccr.ErrCorruptRecovery)
+}
+func (e *corruptEngine) RetrieveQuery(string, string) ([]byte, error) {
+	return nil, fmt.Errorf("retrieve: %w", ccr.ErrCorruptRecovery)
+}
+
+func TestRetrieveReportsCorruptRecoveryDistinctly(t *testing.T) {
+	eng := &corruptEngine{}
+	for _, args := range []json.RawMessage{
+		retrieveArgs("ccr_damaged", ""),
+		json.RawMessage(`{"recovery_handle":"ccr_damaged","verify_only":true}`),
+	} {
+		result := retrieveTool(eng, args)
+		if !result.IsError || !strings.Contains(result.Content[0].Text, "cave_corrupt_recovery") {
+			t.Fatalf("corrupt recovery must report cave_corrupt_recovery: %+v", result)
+		}
+		if strings.Contains(result.Content[0].Text, "cave_unknown_handle") {
+			t.Fatalf("corrupt recovery must not read as an unknown handle: %+v", result)
+		}
+	}
+}
+
+type expiredEngine struct{ storeEngine }
+
+func (e *expiredEngine) Retrieve(string) ([]byte, error) {
+	return nil, fmt.Errorf("retrieve: %w", ccr.ErrExpired)
+}
+func (e *expiredEngine) RetrieveQuery(string, string) ([]byte, error) {
+	return nil, fmt.Errorf("retrieve: %w", ccr.ErrExpired)
+}
+
+func TestRetrieveReportsExpiredObjectDistinctly(t *testing.T) {
+	eng := &expiredEngine{}
+	for _, args := range []json.RawMessage{
+		retrieveArgs("ccr://ccr_obj_old", ""),
+		json.RawMessage(`{"recovery_handle":"ccr_obj_old","verify_only":true}`),
+	} {
+		result := retrieveTool(eng, args)
+		if !result.IsError || !strings.Contains(result.Content[0].Text, "cave_expired_recovery") {
+			t.Fatalf("expired object must report cave_expired_recovery: %+v", result)
+		}
+		if strings.Contains(result.Content[0].Text, "cave_unknown_handle") {
+			t.Fatalf("expired object must not read as an unknown handle: %+v", result)
 		}
 	}
 }

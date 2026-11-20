@@ -42,6 +42,13 @@ caveman tools mem history <id>
 caveman tools mem forget <id>
 ```
 
+`remember` and `supersede` also accept `--stdin` in place of the text argument,
+which is the only way to store a fact larger than one command-line argument
+allows (about 128 KB on Linux, and a 32 KB whole command line on Windows).
+`supersede --stdin` needs a cavemem build that lists the `supersede-stdin`
+capability in `cavemem version --json`; an older one is refused rather than
+sent text it would misread, so upgrade the binary if you see that message.
+
 Recall returns current facts by default and has a default inferred-token budget
 of 2,000. Superseded history remains available for inspection. Recalled compact
 records can include recovery references to exact stored source.
@@ -125,7 +132,7 @@ Local proxy and tools commonly use:
 ~/.caveman/mem/mem.db
 ~/.caveman/mem/ccr.db
 ~/.caveman/caveman.yaml
-~/.caveman-cloud/config.json
+~/.caveman/cloud.json
 ```
 
 Project overlays use `./.caveman/config.json`. Back up or delete these files only

@@ -64,7 +64,7 @@ nothing.
 | Gemini CLI | `~/.gemini/tmp/*/chats/session-*.json` | `~/.gemini/GEMINI.md`, `GEMINI.md` from repo root to cwd | `CAVEMAN_GEMINI_ROOT` |
 | opencode | `~/.local/share/opencode/storage/{session,message,part}` | none | `CAVEMAN_OPENCODE_ROOT` |
 | aider | `.aider.chat.history.md` files under the root | none | `CAVEMAN_AIDER_ROOT` (required; off without it) |
-| Pi | `~/.pi/agent/sessions/**/*.jsonl` | none | `CAVEMAN_PI_ROOT` |
+| Pi | `~/.pi/agent/sessions/**/*.jsonl` | none | `CAVEMAN_PI_ROOT`, then `PI_CODING_AGENT_DIR` (agent dir) and `PI_CODING_AGENT_SESSION_DIR` (sessions dir) |
 
 The memory and rules doctor also reads `.claude/CLAUDE.md`, `CLAUDE.local.md`,
 `.claude/rules/*.md` and `~/.claude/rules/*.md` (path-scoped rules with a
@@ -92,7 +92,7 @@ All paths are under `$CAVEMAN_HOME` (default `~/.caveman`) unless noted.
 | `learn experiment start/arm/stop` | rows in `experiments`, `experiment_arms` |
 | `learn export` | `reports/caveman-learn-digest.json` (or `--out <path>`) |
 | Autopilot | `runtime/learn-autopilot.json`, `.lock`, `-nudge.json`, `-nudge.inflight.json`, `-announced.json`, and its own report, snapshots and trend history under `runtime/learn-autopilot/reports/` |
-| `learn autopilot on/off` | key `learnAutopilot` in `~/.caveman-cloud/config.json` |
+| `learn autopilot on/off` | key `learnAutopilot` in `~/.caveman/cloud.json` |
 | `learn implement` | the skill file, only if missing: `./.claude/skills/caveman-learn/SKILL.md` (Claude Code) or `$CODEX_HOME/skills/caveman-learn/SKILL.md` (Codex) |
 
 Report files are created with mode `0600`.
@@ -189,7 +189,7 @@ Autopilot rescans in the background and tells you about new findings without you
 | Scan | `learn scan --write-report --no-remember --reports-home $CAVEMAN_HOME/runtime/learn-autopilot` with the default window and sources, killed at `CAVE_LEARN_TIMEOUT`. |
 | Proxy check | Before scanning, the detached child runs `caveman-proxy learn capabilities` and needs `no_remember`, `reports_home` and `memory_health`. An older proxy would ignore those flags and write cavemem and the canonical report, so it never scans: `last_error` becomes "proxy too old for autopilot (needs learn capabilities)" and `learn autopilot status` shows it. The result is cached per proxy path, mtime and size, so an upgrade re-probes. The `SessionEnd` hook itself never probes. |
 | Writes | Its own report files, the `caveman.db` plan tables every scan updates, and its own `runtime/learn-autopilot*` state. Never cavemem memories or `learnings` rows: `--no-remember` skips them, because sink titles carry changing counts and each unattended run would add a near-duplicate. |
-| Enable precedence | `CAVEMAN_LEARN_AUTOPILOT` env (`0`, `false`, `off`, `no` disable; anything else enables) → `learnAutopilot` in `~/.caveman-cloud/config.json` → off when `CI` is set (not `0`/`false`) or under `NODE_TEST_CONTEXT` → on. |
+| Enable precedence | `CAVEMAN_LEARN_AUTOPILOT` env (`0`, `false`, `off`, `no` disable; anything else enables) → `learnAutopilot` in `~/.caveman/cloud.json` → off when `CI` is set (not `0`/`false`) or under `NODE_TEST_CONTEXT` → on. |
 | Opt out | `caveman learn autopilot off`, or `CAVEMAN_LEARN_AUTOPILOT=0`. |
 | State | `$CAVEMAN_HOME/runtime/learn-autopilot*.json`. Writes are temp-file + rename and refuse symlinked parents. |
 | Status | `caveman learn autopilot status`: on/off and why, last scan, next scan, last error, last line shown, and a line waiting to show. |
@@ -282,7 +282,7 @@ Classes (the report's label in brackets):
 | `claude_md_weight:{user,project,codex}` | reducible | A `CLAUDE.md` (or `~/.codex/AGENTS.md` for `codex`) over 150 lines or 2000 tokens | `claude_md_weight` | Yes, via skill |
 | `claude_md_sections:{user,project}` | reducible | `CLAUDE.md` sections with no distinctive-line echo in ≥5 sessions. Emitted only if at least one other section did echo. | `claude_md_sections` | Yes, via skill |
 | `dead_load:skills` | reducible | Skills whose descriptions load every turn with no use detected in the window | `dead_load` | Yes, via skill |
-| `recurring_context:repaste:<fingerprint>` | recurring_context | A block of ≥180 tokens re-established in ≥3 sessions. Top 24 listed; the rest still count in the score. | `cavemem_offload` | Yes, via skill |
+| `recurring_context:repaste:<fingerprint>` | recurring_context | A block of ≥180 tokens re-established in ≥3 sessions. Context the host or caveman's own hook re-injects is excluded — the system-reminder envelope carrying `CLAUDE.md`/auto-memory, a hook result, the caveman ruleset — because offloading it saves nothing and it is already counted as always-loaded setup. Top 24 listed; the rest still count in the score. | `cavemem_offload` | Yes, via skill |
 | `context_dumbzone` | behavioral | Turns over 50% of the model window, if ≥10% of turns | `dumbzone_advice` | No |
 | `subagent_overuse` | behavioral | Subagent spawn counts | none | No |
 | `subagent_spend` | behavioral | Share of provider-counted context in subagent sidechains (≥100k tokens, ≥3 sessions). Visibility only. | none | No |
@@ -292,7 +292,7 @@ Classes (the report's label in brackets):
 | `cross_provider:repaste` | behavioral | One recurring block seen in two or more agents | none | No |
 | `learning_loop:error_loop:<session>:<hash>` | behavioral | Same tool call ≥3 times in one session, at least half failing | none | No |
 | `learning_loop:refetch_loop:<session>:<hash>` | behavioral | Same call ≥3 times with only pagination/limit variants, no errors | none | No |
-| `cache_churn` | behavioral | ≥2 sessions with ≥3 turns that each re-wrote >10k tokens and >25% of context to cache | none | No |
+| `cache_churn` | behavioral | ≥2 sessions with ≥3 turns that each re-wrote >10k tokens and >25% of context to cache, at least one of them not a likely cold resume (`previous_message_not_found` after the reported cache TTL). Evidence splits the writes into `cold_resume` / `invalidation` (`tools_changed`) / `unknown`, with up to 5 locators per bucket | none | No |
 | `cache_efficiency` | load_bearing, or behavioral when multiplier ≥ 0.6 | Effective input cost per million tokens after cache reuse (needs ≥200k input tokens). A rate, not a volume. | none | No |
 | `reread_waste` | behavioral | Repeated full reads of the same file (≥5k tokens) | none | No |
 | `compaction_churn` | behavioral | Files re-fetched after compaction (≥2k tokens). May overlap `reread_waste`; never sum them. | none | No |

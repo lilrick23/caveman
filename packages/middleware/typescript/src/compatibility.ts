@@ -6,16 +6,41 @@ import { inRange, installedFrameworkVersion, warnFrameworkMismatch } from './ver
 const frameworks = {
   ai: { floor: '7.0.94', high: '8', tested: ['7.0.94', '7.0.114'], entry: 'ai' },
   openai: { floor: '7.12.1', high: '8', tested: ['7.12.1', '7.23.0'], entry: 'openai' },
-  '@anthropic-ai/sdk': { floor: '0.124.0', high: '0.134', tested: ['0.124.0', '0.125.0', '0.126.0', '0.127.0', '0.128.0', '0.129.0', '0.130.0', '0.131.0', '0.132.0', '0.133.0'], entry: '@anthropic-ai/sdk' },
+  // Upstream closed the 0.x line with 1.0.0 (2026-10-21), whose only breaking change is the default API version, so
+  // this is the one framework whose bound moves from next-minor to next-major: the zero-major caution it encoded cannot
+  // apply to a line that can no longer ship a minor. 1.0.0 and 1.1.0 passed the suite before being claimed here.
+  '@anthropic-ai/sdk': { floor: '0.124.0', high: '2', tested: ['0.124.0', '0.125.0', '0.126.0', '0.127.0', '0.128.0', '0.129.0', '0.130.0', '0.131.0', '0.132.0', '0.133.0', '0.134.0', '0.135.0', '0.136.0', '0.137.0', '1.0.0', '1.1.0'], entry: '@anthropic-ai/sdk' },
   '@google/genai': { floor: '2.21.0', high: '3', tested: ['2.21.0', '2.24.0'], entry: '@google/genai' },
   langchain: { floor: '1.5.10', high: '2', tested: ['1.5.10', '1.5.12'], entry: 'langchain' },
   '@langchain/core': { floor: '1.2.9', high: '2', tested: ['1.2.9', '1.2.12'], entry: '@langchain/core/messages' },
   '@strands-agents/sdk': { floor: '1.17.0', high: '2', tested: ['1.17.0', '1.19.0'], entry: '@strands-agents/sdk' },
   '@mastra/core': { floor: '1.65.0', high: '2', tested: ['1.65.0', '1.70.0'], entry: '@mastra/core/agent' },
-  '@modelcontextprotocol/sdk': { floor: '1.30.0', high: '2', tested: ['1.30.0', '1.30.1'], entry: '@modelcontextprotocol/sdk/client/index.js' },
+  '@modelcontextprotocol/sdk': { floor: '1.32.0', high: '2', tested: ['1.32.0'], entry: '@modelcontextprotocol/sdk/client/index.js' },
 } as const;
 
 type Framework = keyof typeof frameworks;
+/** Why a floor is where it is, when the reason is a fix users must take rather than an untested release. Appended to
+ * the upgrade advice a below-floor version gets. */
+const FLOOR_NOTES: Partial<Record<Framework, string>> = {
+  '@modelcontextprotocol/sdk': 'earlier HTTP transports re-send custom headers, such as credentials, and request bodies across cross-origin redirects (GHSA-6prh-2h8m-c8cw)',
+};
+/** A stable release older than the floor: the one decline whose fix is always "upgrade". */
+function belowFloor(name: Framework, version: string | null): boolean {
+  return inRange(version, '0.0.0', frameworks[name].floor);
+}
+function upgradeAdvice(name: Framework, version: string): string {
+  const note = FLOOR_NOTES[name];
+  return `${name} ${version} is older than the supported floor; upgrade ${name} to ${frameworks[name].floor} or later${note ? ` (${note})` : ''}`;
+}
+/** Once per package and version, beside (not instead of) the standard warn-once pass-through line, which keeps its
+ * shape for anything matching `adapter=<id> reason=unsupported_version`. Same precedent as warnFrameworkMismatch. */
+const advised = new Set<string>();
+function adviseUpgrade(name: Framework, version: string, adapter: string): void {
+  const key = `${name}@${version}`;
+  if (advised.has(key) || advised.size >= 64) return;
+  advised.add(key);
+  console.warn(`Caveman middleware: ${upgradeAdvice(name, version)}. Until then the ${adapter} adapter passes content through unchanged.`);
+}
 // Decision 11: certified adapters are gated by the conformance suite; the rest are experimental. Each entry is gated
 // only on the packages it imports at run time (C11); `@ai-sdk/provider` is imported for types only. `id` is the adapter
 // id in reports and warnings.
@@ -77,7 +102,11 @@ export function frameworkGate(adapter: AdapterName, options: GateOptions, detect
     const version = name in versions ? versions[name] ?? null : frameworkVersion(name);
     if (!(name in versions)) warnFrameworkMismatch(name, version);
     if (version === null) unverified = true;
-    else if (!frameworkCompatible(name, version) && !options.acceptFrameworkVersion) outside = true;
+    else if (!frameworkCompatible(name, version) && !options.acceptFrameworkVersion) {
+      outside = true;
+      // An old release has a fix to take; say which, not just that content passed through.
+      if (belowFloor(name, version)) adviseUpgrade(name, version, id);
+    }
   }
   let reason: GateReason | null = outside ? 'unsupported_version' : null;
   if (!reason && unverified) {
@@ -107,7 +136,9 @@ export function inspectFrameworkCompatibility(adapter: AdapterName): {
       ? tested ? 'Tested release detected; run your workload acceptance checks.' : `Range accepted; tested releases are ${spec.tested.join(', ')}. Run your workload acceptance checks.`
       : version === null
         ? `No installed ${name} metadata found. Bundled builds run after feature detection with a version_unverified warning; keep ${name} external to report its version.`
-        : `Use ${name} ${spec.tested.at(-1)}, or set acceptFrameworkVersion after testing ${version}; until then calls pass through unchanged.`;
+        : belowFloor(name, version)
+          ? `${upgradeAdvice(name, version)}; until then calls pass through unchanged.`
+          : `Use ${name} ${spec.tested.at(-1)}, or set acceptFrameworkVersion after testing ${version}; until then calls pass through unchanged.`;
     return { package: name, installed_version: version, supported_range: `>=${spec.floor} <${spec.high}`,
       tested_version: spec.floor, tested_versions: spec.tested, tested, compatible, reason, action };
   });

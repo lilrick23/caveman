@@ -85,6 +85,34 @@ for (const surface of surfaces) {
     assert.equal(JSON.parse(readFileSync(item.settings, 'utf8')).hooks, undefined);
   });
 
+  test(`${surface.command}: uninstall keeps a settings.json.bak it did not make`, options, (t) => {
+    const item = fixture(t);
+    const hook = join(item.hooks, 'caveman-activate.js');
+    writeFileSync(hook, '');
+    const entry = { type: 'command', command: `node ${hook}` };
+    writeFileSync(item.settings, JSON.stringify({ model: 'opus', hooks: { SessionStart: [{ hooks: [entry] }] } }));
+    const mine = '{"model":"my-own-manual-backup"}\n';
+    writeFileSync(`${item.settings}.bak`, mine);
+    const removed = run(surface, item, 'uninstall');
+    assert.equal(removed.status, 0, removed.stdout + removed.stderr);
+    assert.equal(existsSync(hook), false);
+    assert.equal(readFileSync(`${item.settings}.bak`, 'utf8'), mine);
+  });
+
+  test(`${surface.command}: uninstall keeps the only copy of comments it dropped and removes a plain-JSON backup it made`, options, (t) => {
+    const item = fixture(t);
+    const entry = { type: 'command', command: `node ${join(item.hooks, 'caveman-activate.js')}` };
+    const body = JSON.stringify({ model: 'opus', hooks: { SessionStart: [{ hooks: [entry] }] } });
+    writeFileSync(item.settings, `// my model choice\n${body}\n`);
+    const jsonc = run(surface, item, 'uninstall');
+    assert.equal(jsonc.status, 0, jsonc.stdout + jsonc.stderr);
+    assert.match(readFileSync(`${item.settings}.bak`, 'utf8'), /my model choice/);
+    rmSync(`${item.settings}.bak`);
+    writeFileSync(item.settings, body);
+    assert.equal(run(surface, item, 'uninstall').status, 0);
+    assert.equal(existsSync(`${item.settings}.bak`), false);
+  });
+
   test(`${surface.command}: malformed settings fail before overwriting existing hook bytes`, options, (t) => {
     const item = fixture(t);
     const original = '{ "theme": broken JSON }\n';
@@ -128,5 +156,25 @@ process.exit(result.status ?? 1);`);
     assert.notEqual(installed.status, 0, installed.stdout + installed.stderr);
     assert.doesNotMatch(installed.stdout, /Done!/);
     assert.equal(JSON.parse(readFileSync(item.settings, 'utf8')).theme, 'dark');
+  });
+
+  test(`${surface.command}: an idempotent re-run over JSONC settings changes nothing`, options, (t) => {
+    const item = fixture(t);
+    writeFileSync(item.settings, '{"theme":"dark"}\n');
+    const installed = run(surface, item, 'install');
+    assert.equal(installed.status, 0, installed.stdout + installed.stderr);
+    // The user edits their own settings after install. The ALREADY_INSTALLED
+    // probe reads the same file the merge step does, so it has to use the same
+    // JSONC parser: a bare JSON.parse throws here, the probe reports "not
+    // installed", and the merge step rewrites the file through JSON.stringify
+    // -- dropping the comment and the trailing comma without a fresh backup.
+    const edited = `{ // my theme\n "theme":"dark",\n ${readFileSync(item.settings, 'utf8').slice(1)}`;
+    writeFileSync(item.settings, edited);
+    const backup = readFileSync(`${item.settings}.bak`, 'utf8');
+    const reran = run(surface, item, 'install');
+    assert.equal(reran.status, 0, reran.stdout + reran.stderr);
+    assert.match(reran.stdout, /Nothing to do\. Hooks are already in place\./);
+    assert.equal(readFileSync(item.settings, 'utf8'), edited, 'a no-op re-run must not rewrite user settings');
+    assert.equal(readFileSync(`${item.settings}.bak`, 'utf8'), backup, 'a no-op re-run must not touch the backup');
   });
 }
